@@ -1,0 +1,9 @@
+torch
+transformers
+pillow
+pandas
+numpy
+scikit-learn
+mediapipe
+opencv-python
+xgboost
