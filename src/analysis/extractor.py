@@ -93,67 +93,73 @@ class PoseExtractor:
         
         return waist_y
     
-    def _estimate_waist_width(
+    def _get_torso_width_from_mask(
         self,
         segmentation_mask: np.ndarray,
-        waist_y: float,
-        image_height: int
+        y_level: int,
+        center_x: int
     ) -> float:
         """
-        Calculate true waist width using segmentation mask.
+        Calculate torso width using center-out scan to exclude arms.
+        
+        This method scans left and right from the torso center, stopping at
+        the first gap (0 pixel) to avoid including arms hanging at the sides.
         
         Args:
             segmentation_mask: Body segmentation mask from MediaPipe
-            waist_y: Y-coordinate of waist position (normalized)
-            image_height: Image height in pixels
+            y_level: Y-coordinate (pixel row) to measure
+            center_x: X-coordinate of torso center
             
         Returns:
-            True waist width in pixels from segmentation mask
+            Torso width in pixels (excludes arms)
         """
-        # Convert normalized Y to pixel coordinate
-        waist_y_px = int(waist_y * image_height)
+        image_height, image_width = segmentation_mask.shape
         
-        # Clamp to valid range
-        waist_y_px = max(0, min(waist_y_px, image_height - 1))
+        # Clamp y_level to valid range
+        y_level = max(0, min(y_level, image_height - 1))
+        center_x = max(0, min(center_x, image_width - 1))
         
-        # Get the row of pixels at waist level
-        waist_row = segmentation_mask[waist_y_px, :]
+        # Extract the row at this Y level
+        row = segmentation_mask[y_level, :]
         
-        # Count non-zero pixels (body pixels) in this row
-        waist_width_px = np.count_nonzero(waist_row)
-        
-        return float(waist_width_px)
-    
-    def _calculate_hip_width_from_mask(
-        self,
-        segmentation_mask: np.ndarray,
-        hip_y: float,
-        image_height: int
-    ) -> float:
-        """
-        Calculate true hip width using segmentation mask.
-        
-        Args:
-            segmentation_mask: Body segmentation mask from MediaPipe
-            hip_y: Y-coordinate of hip position (normalized)
-            image_height: Image height in pixels
+        # Fallback: If center pixel is 0, find nearest body pixel
+        if row[center_x] == 0:
+            # Search nearby for a body pixel (within 50px radius)
+            search_radius = 50
+            for offset in range(1, search_radius):
+                # Try left
+                if center_x - offset >= 0 and row[center_x - offset] > 0:
+                    center_x = center_x - offset
+                    break
+                # Try right
+                if center_x + offset < image_width and row[center_x + offset] > 0:
+                    center_x = center_x + offset
+                    break
             
-        Returns:
-            True hip width in pixels from segmentation mask
-        """
-        # Convert normalized Y to pixel coordinate
-        hip_y_px = int(hip_y * image_height)
+            # If still no body pixel found, return 0
+            if row[center_x] == 0:
+                return 0.0
         
-        # Clamp to valid range
-        hip_y_px = max(0, min(hip_y_px, image_height - 1))
+        # Scan Left: Start at center and move backwards until hitting gap or edge
+        left_edge = center_x
+        for x in range(center_x, -1, -1):
+            if row[x] == 0:
+                left_edge = x + 1  # Last valid body pixel
+                break
+            left_edge = x
         
-        # Get the row of pixels at hip level
-        hip_row = segmentation_mask[hip_y_px, :]
+        # Scan Right: Start at center and move forwards until hitting gap or edge
+        right_edge = center_x
+        for x in range(center_x, image_width):
+            if row[x] == 0:
+                right_edge = x - 1  # Last valid body pixel
+                break
+            right_edge = x
         
-        # Count non-zero pixels (body pixels) in this row
-        hip_width_px = np.count_nonzero(hip_row)
+        # Calculate width
+        torso_width = right_edge - left_edge + 1  # +1 because edges are inclusive
         
-        return float(hip_width_px)
+        return float(torso_width)
     
     def extract_metrics(self, image: np.ndarray) -> Optional[Dict[str, Any]]:
         """
@@ -240,29 +246,80 @@ class PoseExtractor:
         left_hip_px = (left_hip.x * image_width, left_hip.y * image_height)
         right_hip_px = (right_hip.x * image_width, right_hip.y * image_height)
         
-        # Calculate shoulder width (skeletal measurement is still accurate)
-        shoulder_width = self._calculate_euclidean_distance(
-            left_shoulder_px, 
-            right_shoulder_px
-        )
-        
         # Calculate waist and hip positions
         shoulder_center_y = (left_shoulder.y + right_shoulder.y) / 2
         hip_center_y = (left_hip.y + right_hip.y) / 2
         waist_y_normalized = self._estimate_waist_position(shoulder_center_y, hip_center_y)
         
-        # Use segmentation mask for true body width measurements
-        hip_width = self._calculate_hip_width_from_mask(
+        # Calculate center X coordinates for torso measurements
+        hip_center_x = (left_hip.x + right_hip.x) / 2
+        waist_center_x = hip_center_x  # Use same center as hips for consistency
+        
+        # Convert to pixel coordinates
+        hip_center_x_px = int(hip_center_x * image_width)
+        waist_center_x_px = int(waist_center_x * image_width)
+        hip_y_px = int(hip_center_y * image_height)
+        waist_y_px = int(waist_y_normalized * image_height)
+        
+        # Step 1: Calculate Skeletal Widths (bone-to-bone distances)
+        shoulder_skeletal = self._calculate_euclidean_distance(
+            left_shoulder_px, 
+            right_shoulder_px
+        )
+        hip_skeletal = self._calculate_euclidean_distance(left_hip_px, right_hip_px)
+        
+        # Step 2: Define Visual Width Multipliers
+        # These account for flesh, deltoids, and clothing extending past joints
+        SHOULDER_MULTIPLIER = 1.18  # Deltoids extend past shoulder joint
+        HIP_MULTIPLIER = 1.15       # Flesh/clothing extends past hip joint
+        
+        # Step 3: Get Mask Widths using center-out scan (excludes arms)
+        hip_mask_width = self._get_torso_width_from_mask(
             segmentation_mask,
-            hip_center_y,
-            image_height
+            hip_y_px,
+            hip_center_x_px
         )
         
-        waist_width = self._estimate_waist_width(
+        waist_mask_width = self._get_torso_width_from_mask(
             segmentation_mask,
-            waist_y_normalized,
-            image_height
+            waist_y_px,
+            waist_center_x_px
         )
+        
+        # Step 4: Robust Decision Tree for Final Measurements
+        
+        # Check 1: Oval/Apple Shape Detection (waist >= hips indicates belly fat)
+        is_oval_shape = waist_mask_width >= hip_mask_width * 0.95
+        
+        if is_oval_shape:
+            # Trust mask for torso, inflate skeletal for shoulders
+            shoulder_width = shoulder_skeletal * SHOULDER_MULTIPLIER
+            hip_width = hip_mask_width
+            waist_width = waist_mask_width
+        else:
+            # Check 2: Arm Interference Detection
+            # If mask hip > 1.35x skeletal, arms are merged with torso
+            arm_interference = hip_mask_width > hip_skeletal * 1.35
+            
+            if arm_interference:
+                # Fallback to inflated skeletal for all measurements
+                shoulder_width = shoulder_skeletal * SHOULDER_MULTIPLIER
+                hip_width = hip_skeletal * HIP_MULTIPLIER
+                waist_width = hip_width * 0.92  # 92% avoids forcing hourglass on rectangles
+            else:
+                # Clean segmentation: inflate skeletal shoulders, trust mask for torso
+                shoulder_width = shoulder_skeletal * SHOULDER_MULTIPLIER
+                hip_width = hip_mask_width
+                waist_width = waist_mask_width
+        
+        # Safety check: If measurements are suspiciously small, fall back to skeletal
+        min_reasonable_width = image_width * 0.20  # 20% of image width
+        
+        if hip_width < min_reasonable_width:
+            hip_width = hip_skeletal * HIP_MULTIPLIER
+        
+        if waist_width < min_reasonable_width:
+            waist_width = hip_skeletal * 0.92
         
         # Calculate waist point coordinates for visualization
         waist_center_x = (left_hip.x + right_hip.x) / 2
