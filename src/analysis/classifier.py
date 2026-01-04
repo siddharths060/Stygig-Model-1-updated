@@ -13,10 +13,12 @@ class BodyShapeClassifier:
     """
     
     # Classification thresholds (fashion industry standards)
-    RATIO_THRESHOLD_HIGH = 1.20  # Shoulders significantly wider than hips
+    RATIO_THRESHOLD_INVERTED = 1.45  # Extreme V-taper (Inverted Triangle)
+    RATIO_THRESHOLD_TRAPEZOID = 1.30  # Athletic build (Trapezoid) - stricter
     RATIO_THRESHOLD_LOW = 0.95   # Hips significantly wider than shoulders
     WAIST_DEFINITION_THRESHOLD = 0.20  # 20% difference for rectangle classification
     HOURGLASS_WAIST_RATIO = 0.80  # Waist must be < 80% of hips for hourglass
+    WAIST_HIP_RATIO_OVAL = 1.0  # Waist >= Hip indicates Oval/Apple shape
     
     def __init__(self) -> None:
         """Initialize the body shape classifier."""
@@ -75,7 +77,7 @@ class BodyShapeClassifier:
         """
         Check if body shape is Inverted Triangle.
         
-        Inverted Triangle: Shoulders are significantly wider than hips.
+        Inverted Triangle: Shoulders are extremely wider than hips (V-taper).
         
         Args:
             ratio_sh: Shoulder-to-hip ratio
@@ -84,7 +86,49 @@ class BodyShapeClassifier:
         Returns:
             True if shape is Inverted Triangle
         """
-        return ratio_sh > self.RATIO_THRESHOLD_HIGH
+        return ratio_sh > self.RATIO_THRESHOLD_INVERTED
+    
+    def _classify_oval(
+        self,
+        waist_width: float,
+        hip_width: float
+    ) -> bool:
+        """
+        Check if body shape is Oval (Apple).
+        
+        Oval/Apple: Waist is wider than or equal to hips (belly/midsection carries weight).
+        
+        Args:
+            waist_width: Waist width in pixels
+            hip_width: Hip width in pixels
+            
+        Returns:
+            True if shape is Oval
+        """
+        if hip_width == 0:
+            return False
+        
+        waist_hip_ratio = waist_width / hip_width
+        return waist_hip_ratio >= self.WAIST_HIP_RATIO_OVAL
+    
+    def _classify_trapezoid(
+        self,
+        ratio_sh: float,
+        waist_definition: float
+    ) -> bool:
+        """
+        Check if body shape is Trapezoid.
+        
+        Trapezoid: Athletic build with moderately wider shoulders than hips.
+        
+        Args:
+            ratio_sh: Shoulder-to-hip ratio
+            waist_definition: Waist definition ratio
+            
+        Returns:
+            True if shape is Trapezoid
+        """
+        return self.RATIO_THRESHOLD_TRAPEZOID < ratio_sh <= self.RATIO_THRESHOLD_INVERTED
     
     def _classify_triangle_pear(
         self,
@@ -123,7 +167,7 @@ class BodyShapeClassifier:
             True if shape is Hourglass
         """
         # Shoulders and hips are balanced
-        balanced = self.RATIO_THRESHOLD_LOW <= ratio_sh <= self.RATIO_THRESHOLD_HIGH
+        balanced = self.RATIO_THRESHOLD_LOW <= ratio_sh <= self.RATIO_THRESHOLD_TRAPEZOID
         
         # Waist is significantly smaller than hips/shoulders
         defined_waist = waist_definition < self.HOURGLASS_WAIST_RATIO
@@ -148,7 +192,7 @@ class BodyShapeClassifier:
             True if shape is Rectangle
         """
         # Shoulders and hips are balanced
-        balanced = self.RATIO_THRESHOLD_LOW <= ratio_sh <= self.RATIO_THRESHOLD_HIGH
+        balanced = self.RATIO_THRESHOLD_LOW <= ratio_sh <= self.RATIO_THRESHOLD_TRAPEZOID
         
         # Waist is not significantly smaller (minimal definition)
         minimal_waist = waist_definition >= self.HOURGLASS_WAIST_RATIO
@@ -167,8 +211,10 @@ class BodyShapeClassifier:
                 
         Returns:
             Body shape classification string:
-                - "Inverted Triangle": Shoulders wider than hips
-                - "Triangle" or "Pear": Hips wider than shoulders
+                - "Oval": Waist wider than or equal to hips (Apple shape)
+                - "Inverted Triangle": Shoulders extremely wider than hips
+                - "Trapezoid": Athletic build with moderately wider shoulders
+                - "Pear": Hips wider than shoulders
                 - "Hourglass": Balanced with defined waist
                 - "Rectangle": Balanced with minimal waist definition
             Returns None if metrics are invalid
@@ -196,8 +242,15 @@ class BodyShapeClassifier:
         # Classify based on fashion industry standards
         # Order matters: Check most specific classifications first
         
+        # Check for Oval FIRST - if waist >= hips, it's Oval regardless of shoulders
+        if self._classify_oval(waist_width, hip_width):
+            return "Oval"
+        
         if self._classify_inverted_triangle(ratio_sh, waist_definition):
             return "Inverted Triangle"
+        
+        if self._classify_trapezoid(ratio_sh, waist_definition):
+            return "Trapezoid"
         
         if self._classify_triangle_pear(ratio_sh, waist_definition):
             return "Pear"

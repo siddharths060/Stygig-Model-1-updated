@@ -214,6 +214,11 @@ class SkinToneAnalyzer:
                 - confidence: Measure of color clustering quality
             Returns None if face detection fails
         """
+        # Track coordinate transformation for zoom & retry logic
+        zoom_scale = 1.0
+        offset_x = 0
+        offset_y = 0
+        
         # Convert BGR to RGB for MediaPipe
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
@@ -223,8 +228,42 @@ class SkinToneAnalyzer:
         # Process the image
         results = self.face_mesh.detect(mp_image)
         
+        # Check if face was detected
         if not results.face_landmarks or len(results.face_landmarks) == 0:
-            return None
+            # Zoom & Retry: Face might be too small in full-body image
+            # Crop top-center region where face is typically located
+            height, width = image.shape[:2]
+            
+            # Define ROI: top third of image, center horizontally
+            roi_y_start = 0
+            roi_y_end = height // 3
+            roi_x_start = width // 4
+            roi_x_end = 3 * width // 4
+            
+            # Crop the ROI
+            roi = image[roi_y_start:roi_y_end, roi_x_start:roi_x_end]
+            
+            # Upscale by 2x for better detection
+            roi_height, roi_width = roi.shape[:2]
+            roi_upscaled = cv2.resize(roi, (roi_width * 2, roi_height * 2), interpolation=cv2.INTER_CUBIC)
+            
+            # Convert to RGB and create MediaPipe image
+            roi_rgb = cv2.cvtColor(roi_upscaled, cv2.COLOR_BGR2RGB)
+            mp_image_roi = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi_rgb)
+            
+            # Retry detection on zoomed crop
+            results = self.face_mesh.detect(mp_image_roi)
+            
+            if not results.face_landmarks or len(results.face_landmarks) == 0:
+                return None
+            
+            # Face found in crop - update transformation tracking
+            zoom_scale = 2.0
+            offset_x = roi_x_start
+            offset_y = roi_y_start
+            
+            # Use the upscaled ROI for analysis
+            image = roi_upscaled
         
         # Use the first detected face
         face_landmarks = results.face_landmarks[0]
@@ -255,6 +294,23 @@ class SkinToneAnalyzer:
         cluster_distance = np.linalg.norm(cluster_centers[0] - cluster_centers[1])
         confidence = min(cluster_distance / 100.0, 1.0)  # Normalize to 0-1
         
+        # Calculate face bounding box for visualization
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            # Get bounding box of the largest contour (face mask)
+            largest_contour = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            
+            # Transform coordinates back to original image space
+            # If zoom & retry was used, bbox is in zoomed space, need to convert back
+            final_x = int(x / zoom_scale) + offset_x
+            final_y = int(y / zoom_scale) + offset_y
+            final_w = int(w / zoom_scale)
+            final_h = int(h / zoom_scale)
+            face_bbox = (final_x, final_y, final_w, final_h)
+        else:
+            face_bbox = None
+        
         return {
             'lab_values': {
                 'L': float(dominant_lab[0]),
@@ -267,5 +323,6 @@ class SkinToneAnalyzer:
                 'G': float(dominant_bgr[1]),
                 'R': float(dominant_bgr[2])
             },
-            'confidence': float(confidence)
+            'confidence': float(confidence),
+            'face_bbox': face_bbox
         }

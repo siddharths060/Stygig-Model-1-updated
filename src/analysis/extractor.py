@@ -34,7 +34,8 @@ class PoseExtractor:
             num_poses=1,
             min_pose_detection_confidence=0.5,
             min_pose_presence_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
+            output_segmentation_masks=True
         )
         self.pose = vision.PoseLandmarker.create_from_options(options)
     
@@ -94,43 +95,65 @@ class PoseExtractor:
     
     def _estimate_waist_width(
         self,
-        landmarks: Any,
+        segmentation_mask: np.ndarray,
         waist_y: float,
-        image_width: int,
         image_height: int
     ) -> float:
         """
-        Estimate waist width at the calculated waist height.
+        Calculate true waist width using segmentation mask.
         
         Args:
-            landmarks: MediaPipe pose landmarks
+            segmentation_mask: Body segmentation mask from MediaPipe
             waist_y: Y-coordinate of waist position (normalized)
-            image_width: Image width in pixels
             image_height: Image height in pixels
             
         Returns:
-            Estimated waist width in pixels
+            True waist width in pixels from segmentation mask
         """
-        # Get left and right hip landmarks (indices 23, 24)
-        left_hip = landmarks.landmark[23]
-        right_hip = landmarks.landmark[24]
+        # Convert normalized Y to pixel coordinate
+        waist_y_px = int(waist_y * image_height)
         
-        # For MVP, estimate waist width as a proportion of hip width
-        # Fashion heuristic: waist is typically 70-90% of hip width depending on body shape
-        # We use 80% as a reasonable middle estimate
-        hip_width_normalized = abs(right_hip.x - left_hip.x)
+        # Clamp to valid range
+        waist_y_px = max(0, min(waist_y_px, image_height - 1))
         
-        # Apply a slight taper factor (waist is typically narrower)
-        waist_width_normalized = hip_width_normalized * 0.85
+        # Get the row of pixels at waist level
+        waist_row = segmentation_mask[waist_y_px, :]
         
-        # Convert to pixels
-        waist_width_px = waist_width_normalized * image_width
+        # Count non-zero pixels (body pixels) in this row
+        waist_width_px = np.count_nonzero(waist_row)
         
-        # Apply same 1.10 inflation factor as hips for consistency
-        # (accounts for flesh and clothing volume)
-        waist_width_px = waist_width_px * 1.10
+        return float(waist_width_px)
+    
+    def _calculate_hip_width_from_mask(
+        self,
+        segmentation_mask: np.ndarray,
+        hip_y: float,
+        image_height: int
+    ) -> float:
+        """
+        Calculate true hip width using segmentation mask.
         
-        return waist_width_px
+        Args:
+            segmentation_mask: Body segmentation mask from MediaPipe
+            hip_y: Y-coordinate of hip position (normalized)
+            image_height: Image height in pixels
+            
+        Returns:
+            True hip width in pixels from segmentation mask
+        """
+        # Convert normalized Y to pixel coordinate
+        hip_y_px = int(hip_y * image_height)
+        
+        # Clamp to valid range
+        hip_y_px = max(0, min(hip_y_px, image_height - 1))
+        
+        # Get the row of pixels at hip level
+        hip_row = segmentation_mask[hip_y_px, :]
+        
+        # Count non-zero pixels (body pixels) in this row
+        hip_width_px = np.count_nonzero(hip_row)
+        
+        return float(hip_width_px)
     
     def extract_metrics(self, image: np.ndarray) -> Optional[Dict[str, Any]]:
         """
@@ -150,10 +173,30 @@ class PoseExtractor:
                 - waist_coords: Estimated coordinates of waist points
             Returns None if pose detection fails
         """
+        # Get original image dimensions
+        orig_height, orig_width = image.shape[:2]
+        
+        # Pad image to multiple of 32 to avoid MediaPipe/XNNPACK memory alignment issues
+        # This prevents "Check failed: 1 == ChannelSize()" errors with segmentation masks
+        pad_h = (32 - (orig_height % 32)) % 32
+        pad_w = (32 - (orig_width % 32)) % 32
+        
+        # Add padding to bottom and right (keeps top-left origin at 0,0)
+        if pad_h > 0 or pad_w > 0:
+            image = cv2.copyMakeBorder(
+                image,
+                top=0,
+                bottom=pad_h,
+                left=0,
+                right=pad_w,
+                borderType=cv2.BORDER_CONSTANT,
+                value=(0, 0, 0)
+            )
+        
         # Convert BGR to RGB for MediaPipe
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Get image dimensions
+        # Get padded image dimensions (used for all coordinate calculations)
         image_height, image_width = image.shape[:2]
         
         # Create MediaPipe Image object
@@ -165,8 +208,23 @@ class PoseExtractor:
         if not results.pose_landmarks or len(results.pose_landmarks) == 0:
             return None
         
-        # Get the first pose's landmarks
+        # Check if segmentation masks are available
+        if not results.segmentation_masks or len(results.segmentation_masks) == 0:
+            return None
+        
+        # Get the first pose's landmarks and segmentation mask
         landmarks_list = results.pose_landmarks[0]
+        
+        # Convert segmentation mask to numpy array and threshold to binary
+        # Make a copy immediately to avoid MediaPipe internal processing issues
+        segmentation_mask_raw = results.segmentation_masks[0].numpy_view().copy()
+        
+        # Convert to single channel if needed and create binary mask (0 or 1)
+        if len(segmentation_mask_raw.shape) > 2:
+            segmentation_mask_raw = segmentation_mask_raw[:, :, 0]
+        
+        # Threshold to create binary mask (values > 0.5 are body)
+        segmentation_mask = (segmentation_mask_raw > 0.5).astype(np.uint8)
         
         # Extract key landmark indices
         # Shoulders: 11 (Left), 12 (Right)
@@ -182,36 +240,27 @@ class PoseExtractor:
         left_hip_px = (left_hip.x * image_width, left_hip.y * image_height)
         right_hip_px = (right_hip.x * image_width, right_hip.y * image_height)
         
-        # Calculate widths
+        # Calculate shoulder width (skeletal measurement is still accurate)
         shoulder_width = self._calculate_euclidean_distance(
             left_shoulder_px, 
             right_shoulder_px
         )
-        hip_width = self._calculate_euclidean_distance(
-            left_hip_px, 
-            right_hip_px
-        )
-        # MediaPipe detects skeletal joints, not outer body silhouette
-        # Apply 10% inflation to account for flesh and clothing volume
-        hip_width = hip_width * 1.10
         
-        # Calculate waist position
+        # Calculate waist and hip positions
         shoulder_center_y = (left_shoulder.y + right_shoulder.y) / 2
         hip_center_y = (left_hip.y + right_hip.y) / 2
         waist_y_normalized = self._estimate_waist_position(shoulder_center_y, hip_center_y)
         
-        # Create a simple object to hold landmarks for the helper function
-        class LandmarksWrapper:
-            def __init__(self, lm_list):
-                self.landmark = lm_list
+        # Use segmentation mask for true body width measurements
+        hip_width = self._calculate_hip_width_from_mask(
+            segmentation_mask,
+            hip_center_y,
+            image_height
+        )
         
-        landmarks_wrapper = LandmarksWrapper(landmarks_list)
-        
-        # Estimate waist width
         waist_width = self._estimate_waist_width(
-            landmarks_wrapper,
+            segmentation_mask,
             waist_y_normalized,
-            image_width,
             image_height
         )
         

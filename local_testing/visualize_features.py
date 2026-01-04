@@ -101,46 +101,84 @@ class FeatureVisualizer:
         
         return annotated
     
-    def _add_text_overlay(
+    def _draw_face_analysis(
         self,
         image: np.ndarray,
-        body_shape: str,
-        undertone: Optional[str]
+        skin_data: dict
     ) -> np.ndarray:
         """
-        Add text overlay with analysis results.
+        Draw face analysis details including bounding box, color swatch, and undertone.
         
         Args:
             image: Input image
-            body_shape: Body shape classification
-            undertone: Skin tone undertone (or None if not available)
+            skin_data: Dictionary containing skin tone analysis results
             
         Returns:
-            Image with text overlay
+            Image with face analysis visualization
         """
         annotated = image.copy()
-        height, width = image.shape[:2]
         
-        # Prepare text
-        if undertone:
-            text = f"Shape: {body_shape} | Undertone: {undertone}"
-        else:
-            text = f"Shape: {body_shape} | Undertone: N/A"
+        # Extract face bounding box and color data
+        face_bbox = skin_data.get('face_bbox')
+        if face_bbox is None:
+            return annotated
+        
+        x, y, w, h = face_bbox
+        undertone = skin_data['undertone']
+        bgr_values = skin_data['bgr_values']
+        
+        # Draw face bounding box (cyan color for visibility)
+        box_color = (255, 255, 0)  # Cyan in BGR
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), box_color, 2)
+        
+        # Draw color swatch (30x30 filled square) next to the face box
+        swatch_size = 30
+        swatch_x = x + w + 10  # 10px to the right of face box
+        swatch_y = y
+        
+        # Extract BGR color as integers
+        swatch_color = (
+            int(bgr_values['B']),
+            int(bgr_values['G']),
+            int(bgr_values['R'])
+        )
+        
+        # Draw filled rectangle for color swatch
+        cv2.rectangle(
+            annotated,
+            (swatch_x, swatch_y),
+            (swatch_x + swatch_size, swatch_y + swatch_size),
+            swatch_color,
+            -1  # Filled
+        )
+        
+        # Draw border around swatch for visibility
+        cv2.rectangle(
+            annotated,
+            (swatch_x, swatch_y),
+            (swatch_x + swatch_size, swatch_y + swatch_size),
+            self.COLOR_WHITE,
+            2
+        )
+        
+        # Add undertone text above the face box
+        undertone_text = f"Undertone: {undertone}"
+        text_y = max(y - 10, 20)  # Position above box, but not off-screen
         
         # Calculate text size for background
         (text_width, text_height), baseline = cv2.getTextSize(
-            text,
+            undertone_text,
             self.FONT,
-            self.FONT_SCALE,
+            self.FONT_SCALE * 0.8,  # Slightly smaller font
             self.FONT_THICKNESS
         )
         
-        # Draw semi-transparent background rectangle
+        # Draw semi-transparent background for text
         overlay = annotated.copy()
         cv2.rectangle(
             overlay,
-            (self.TEXT_PADDING - 5, self.TEXT_PADDING - 5),
-            (self.TEXT_PADDING + text_width + 5, self.TEXT_PADDING + text_height + baseline + 5),
+            (x - 2, text_y - text_height - 2),
+            (x + text_width + 2, text_y + baseline + 2),
             (0, 0, 0),
             -1
         )
@@ -149,14 +187,99 @@ class FeatureVisualizer:
         # Draw text
         cv2.putText(
             annotated,
-            text,
-            (self.TEXT_PADDING, self.TEXT_PADDING + text_height),
+            undertone_text,
+            (x, text_y),
             self.FONT,
-            self.FONT_SCALE,
+            self.FONT_SCALE * 0.8,
             self.COLOR_WHITE,
             self.FONT_THICKNESS,
             cv2.LINE_AA
         )
+        
+        return annotated
+    
+    def _add_text_overlay(
+        self,
+        image: np.ndarray,
+        body_shape: str,
+        undertone: Optional[str],
+        metrics: dict
+    ) -> np.ndarray:
+        """
+        Add text overlay with detailed analysis results.
+        
+        Args:
+            image: Input image
+            body_shape: Body shape classification
+            undertone: Skin tone undertone (or None if not available)
+            metrics: Dictionary containing body measurements
+            
+        Returns:
+            Image with text overlay
+        """
+        annotated = image.copy()
+        height, width = image.shape[:2]
+        
+        # Calculate ratios
+        shoulder_width = metrics['shoulder_px']
+        hip_width = metrics['hip_px']
+        waist_width = metrics['waist_px']
+        
+        sh_ratio = shoulder_width / hip_width if hip_width > 0 else 0.0
+        wh_ratio = waist_width / hip_width if hip_width > 0 else 0.0
+        
+        # Prepare multi-line text
+        undertone_text = undertone if undertone else "N/A"
+        lines = [
+            f"Shape: {body_shape}",
+            f"Undertone: {undertone_text}",
+            f"S/H Ratio: {sh_ratio:.2f}",
+            f"W/H Ratio: {wh_ratio:.2f}"
+        ]
+        
+        # Calculate maximum text width and total height
+        max_text_width = 0
+        line_heights = []
+        
+        for line in lines:
+            (text_width, text_height), baseline = cv2.getTextSize(
+                line,
+                self.FONT,
+                self.FONT_SCALE,
+                self.FONT_THICKNESS
+            )
+            max_text_width = max(max_text_width, text_width)
+            line_heights.append(text_height + baseline)
+        
+        # Calculate total height with spacing between lines
+        line_spacing = 10
+        total_height = sum(line_heights) + (len(lines) - 1) * line_spacing
+        
+        # Draw semi-transparent background rectangle
+        overlay = annotated.copy()
+        cv2.rectangle(
+            overlay,
+            (self.TEXT_PADDING - 5, self.TEXT_PADDING - 5),
+            (self.TEXT_PADDING + max_text_width + 10, self.TEXT_PADDING + total_height + 10),
+            (0, 0, 0),
+            -1
+        )
+        cv2.addWeighted(overlay, 0.6, annotated, 0.4, 0, annotated)
+        
+        # Draw each line of text
+        y_offset = self.TEXT_PADDING
+        for i, line in enumerate(lines):
+            cv2.putText(
+                annotated,
+                line,
+                (self.TEXT_PADDING, y_offset + line_heights[i]),
+                self.FONT,
+                self.FONT_SCALE,
+                self.COLOR_WHITE,
+                self.FONT_THICKNESS,
+                cv2.LINE_AA
+            )
+            y_offset += line_heights[i] + line_spacing
         
         return annotated
     
@@ -214,8 +337,12 @@ class FeatureVisualizer:
         print("  - Creating visualization...")
         annotated = self._draw_measurement_lines(image, metrics)
         
-        # Add text overlay
-        annotated = self._add_text_overlay(annotated, body_shape, undertone)
+        # Draw face analysis details if skin tone was detected
+        if skin_tone:
+            annotated = self._draw_face_analysis(annotated, skin_tone)
+        
+        # Add text overlay with detailed metrics
+        annotated = self._add_text_overlay(annotated, body_shape, undertone, metrics)
         
         print("Visualization complete!")
         return annotated
